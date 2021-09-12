@@ -16,7 +16,15 @@ struct ConvertRate
   RateFn rateFn;
 };
 
-class Converter
+class IConverter
+{
+public:
+  virtual void init(const std::vector<ConvertRate>& _rates) =0;
+  virtual double convert(double value, CurId from, CurId to) =0;
+  virtual ~IConverter() {}
+};
+
+class Converter : public IConverter
 {
 public:
   Converter()
@@ -27,6 +35,7 @@ public:
   // any currency pair, if such conversion possible
   // Takes O(R * N^2) time and O(N^2) memory, where N - number of currencies
   // and R - number of currency rates
+  // In worst case R = N^2, so overall complexity O(N^4)
   void init(const std::vector<ConvertRate>& _rates)
   {
     Cell defaultCell;
@@ -101,7 +110,7 @@ public:
       }
       prevCur = nextCur;
     } while (nextCur != to);
-	
+
 	// weird compiler behavior, when multiplication result is 0 (seems casts to int)
 	double finalValue = static_cast<long double>(totalRate) * static_cast<long double>(value);
     return finalValue;
@@ -122,95 +131,122 @@ private:
   std::vector<RateFn> rates;
 };
 
+// It's not canonical GOF Factory
+class ConverterFactory
+{
+public:
+  enum class Type { STUPID, OPTIMIZED, BFS};
+  void setType(Type type) { mType = type; }
+  std::unique_ptr<IConverter> create() const
+  {
+    switch(mType)
+    {
+      case Type::STUPID:
+        return std::make_unique<Converter>();
+      case Type::OPTIMIZED:
+      case Type::BFS:
+        throw;
+    }
+  }
+private:
+  Type mType;
+};
+
+void runTests(const ConverterFactory& factory)
+{
+  using namespace std;
+  {
+    cout << "Test 1 one rate smoke";
+    vector<ConvertRate> rates{{0,1,[](){return 2.0;}}};
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 1) == 200.0);
+    assert(cvt->convert(100.0, 1, 0) == 50.0);
+    cout << " end" << endl;
+  }
+  {
+    cout << "Test 2 two independent rates";
+    vector<ConvertRate> rates{
+      {0,1,[](){return 2.0;}},
+      {2,3,[](){return 4.0;}}
+    };
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 1) == 200.0);
+    assert(cvt->convert(100.0, 1, 0) == 50.0);
+    assert(cvt->convert(100.0, 2, 3) == 400.0);
+    assert(cvt->convert(400.0, 3, 2) == 100.0);
+    cout << " end" << endl;
+  }
+  {
+    cout << "Test 3 sequential rates";
+    vector<ConvertRate> rates{
+      {0,1,[](){return 2.0;}},
+      {1,2,[](){return 3.0;}},
+      {2,3,[](){return 4.0;}}
+    };
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 1) == 200.0);
+    assert(cvt->convert(100.0, 1, 0) == 50.0);
+    assert(cvt->convert(100.0, 2, 3) == 400.0);
+    assert(cvt->convert(400.0, 3, 2) == 100.0);
+    assert(cvt->convert( 10.0, 0, 3) == 240.0);
+    assert(cvt->convert(240.0, 3, 0) == 10.0);
+    cout << " end" << endl;
+  }
+  {
+    cout << "Test 4 merge two rate graphs";
+    vector<ConvertRate> rates{
+      {0,1,[](){return 2.0;}},
+      {2,3,[](){return 4.0;}},
+      {1,2,[](){return 3.0;}}
+    };
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 1) == 200.0);
+    assert(cvt->convert(100.0, 1, 0) == 50.0);
+    assert(cvt->convert(100.0, 2, 3) == 400.0);
+    assert(cvt->convert(400.0, 3, 2) == 100.0);
+    assert(cvt->convert( 10.0, 0, 3) == 240.0);
+    assert(cvt->convert(240.0, 3, 0) == 10.0);
+    cout << " end" << endl;
+  }
+  {
+    cout << "Test 5 choose shortest path";
+    vector<ConvertRate> rates{
+      {0,1,[](){return 2.0;}},
+      {1,2,[](){return 3.0;}},
+      {2,3,[](){return 4.0;}},
+      {4,3,[](){return 5.0;}},
+      {0,4,[](){return 6.0;}},
+    };
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 3)  == 3000.0);
+    assert(cvt->convert(3000.0, 3, 0) == 100.0);
+    cout << " end" << endl;
+  }
+  {
+    cout << "Test 6 max N smoke";
+    vector<ConvertRate> rates;
+    for(CurId i = 0; i < MAX_CUR_NUMBER - 1; ++i)
+    {
+      rates.push_back({i, i+1, [](){return 2.0;}});
+    };
+    rates.push_back({ MAX_CUR_NUMBER - 1, 0, [](){return 2.0;}});
+    auto cvt{factory.create()};
+    cvt->init(rates);
+    assert(cvt->convert(100.0, 0, 1)  == 200.0);
+    assert(cvt->convert(100.0, MAX_CUR_NUMBER - 2, 0)  == 400.0);
+    cout << " end" << endl;
+  }
+}
+
 int main()
 {
-    using namespace std;
-    // tests
-    {
-      cout << "Test 1 one rate smoke";
-      vector<ConvertRate> rates{{0,1,[](){return 2.0;}}};
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 1) == 200.0);
-      assert(cvt->convert(100.0, 1, 0) == 50.0);
-      cout << " end" << endl;
-    }
-    {
-      cout << "Test 2 two independent rates";
-      vector<ConvertRate> rates{
-        {0,1,[](){return 2.0;}},
-        {2,3,[](){return 4.0;}}
-      };
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 1) == 200.0);
-      assert(cvt->convert(100.0, 1, 0) == 50.0);
-      assert(cvt->convert(100.0, 2, 3) == 400.0);
-      assert(cvt->convert(400.0, 3, 2) == 100.0);
-      cout << " end" << endl;
-    }
-    {
-      cout << "Test 3 sequential rates";
-      vector<ConvertRate> rates{
-        {0,1,[](){return 2.0;}},
-        {1,2,[](){return 3.0;}},
-        {2,3,[](){return 4.0;}}
-      };
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 1) == 200.0);
-      assert(cvt->convert(100.0, 1, 0) == 50.0);
-      assert(cvt->convert(100.0, 2, 3) == 400.0);
-      assert(cvt->convert(400.0, 3, 2) == 100.0);
-      assert(cvt->convert( 10.0, 0, 3) == 240.0);
-      assert(cvt->convert(240.0, 3, 0) == 10.0);
-      cout << " end" << endl;
-    }
-    {
-      cout << "Test 4 merge two rate graphs";
-      vector<ConvertRate> rates{
-        {0,1,[](){return 2.0;}},
-        {2,3,[](){return 4.0;}},
-        {1,2,[](){return 3.0;}}
-      };
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 1) == 200.0);
-      assert(cvt->convert(100.0, 1, 0) == 50.0);
-      assert(cvt->convert(100.0, 2, 3) == 400.0);
-      assert(cvt->convert(400.0, 3, 2) == 100.0);
-      assert(cvt->convert( 10.0, 0, 3) == 240.0);
-      assert(cvt->convert(240.0, 3, 0) == 10.0);
-      cout << " end" << endl;
-    }
-    {
-      cout << "Test 5 choose shortest path";
-      vector<ConvertRate> rates{
-        {0,1,[](){return 2.0;}},
-        {1,2,[](){return 3.0;}},
-        {2,3,[](){return 4.0;}},
-        {4,3,[](){return 5.0;}},
-        {0,4,[](){return 6.0;}},
-      };
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 3)  == 3000.0);
-      assert(cvt->convert(3000.0, 3, 0) == 100.0);
-      cout << " end" << endl;
-    }
-    {
-      cout << "Test 6 max N smoke";
-      vector<ConvertRate> rates;
-      for(CurId i = 0; i < MAX_CUR_NUMBER - 1; ++i)
-      {
-        rates.push_back({i, i+1, [](){return 2.0;}});
-      };
-      rates.push_back({ MAX_CUR_NUMBER - 1, 0, [](){return 2.0;}});
-      unique_ptr<Converter> cvt{make_unique<Converter>()};
-      cvt->init(rates);
-      assert(cvt->convert(100.0, 0, 1)  == 200.0);
-      assert(cvt->convert(100.0, MAX_CUR_NUMBER - 2, 0)  == 400.0);
-      cout << " end" << endl;
-    }
-    return 0;
+  ConverterFactory factory;
+  factory.setType(ConverterFactory::Type::STUPID);
+  runTests(factory);
+  return 0;
 }
