@@ -1,9 +1,11 @@
 #include <iostream>
-#include <functional>
-#include <vector>
-#include <limits>
 #include <cassert>
+#include <functional>
+#include <limits>
+#include <list>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 const uint32_t MAX_CUR_NUMBER = 2000;
 using CurId = uint64_t; // 1..2000
@@ -19,11 +21,14 @@ struct ConvertRate
 class IConverter
 {
 public:
+  // precomputes all optimal pathes to calculate conversion rate between
+  // any currency pair, if such conversion possible
   virtual void init(const std::vector<ConvertRate>& _rates) =0;
   virtual double convert(double value, CurId from, CurId to) =0;
   virtual ~IConverter() {}
 };
 
+// This implementation is faster on sparse graphs
 class Converter : public IConverter
 {
 public:
@@ -31,8 +36,6 @@ public:
   {
   }
 
-  // precomputes all optimal pathes to calculate conversion rate between
-  // any currency pair, if such conversion possible
   // Takes O(R * N^2) time and O(N^2) memory, where N - number of currencies
   // and R - number of currency rates
   // In worst case R = N^2, so overall complexity O(N^4)
@@ -131,22 +134,140 @@ private:
   std::vector<RateFn> rates;
 };
 
+class BFSConverter : public IConverter
+{
+public:
+  BFSConverter()
+  {
+  }
+
+  void init(const std::vector<ConvertRate>& rates)
+  {
+    mRates.clear();
+    mPaths.clear();
+    // add to mPaths all direct convert rates
+    // and init mRates
+    // complexity is O(R), worst case O(N^2)
+    mRates.reserve(rates.size() + 1);
+    mRates.push_back([]() { return 0.0; }); // add dummy fn
+    mPaths.resize(MAX_CUR_NUMBER);
+    for (const auto& rate : rates)
+    {
+      int32_t newRateId = static_cast<int32_t>(mRates.size());
+      mRates.push_back(rate.rateFn);
+
+      const CurId from = rate.from;
+      const CurId to = rate.to;
+      mPaths[from][to] = Cell(to, newRateId);
+      mPaths[to][from] = Cell(from, -newRateId);
+    }
+
+    // Do BFS from each node to find all shortest paths
+    // thus complexity is O(N(N + R)) = O(N^3)
+    std::vector<CurId> visitedNodes(MAX_CUR_NUMBER, MAX_CUR_NUMBER);
+    for (CurId from = 0; from < mPaths.size(); ++from)
+    {
+      visitedNodes[from] = from;
+      // first - next to visit, second is started from
+      using NextCur = std::pair<CurId, CurId>;
+      std::list<NextCur> nextToVisitCurs;
+      for (const auto& cell : mPaths[from])
+      {
+        const CurId next = cell.first;
+        nextToVisitCurs.push_back(NextCur(next, next));
+        visitedNodes[next] = from;
+      }
+      auto nextIt = nextToVisitCurs.begin();
+      while (nextIt != nextToVisitCurs.end())
+      {
+        const CurId visitingId = nextIt->first;
+        visitedNodes[visitingId] = from;
+        for(const auto& nextPath : mPaths[visitingId])
+        {
+          auto& cell = nextPath.second;
+          if (visitedNodes[cell.nextCur] != from)
+          {
+            visitedNodes[cell.nextCur] = from;
+            nextToVisitCurs.emplace_back(cell.nextCur, nextIt->second);
+            mPaths[from][cell.nextCur] = Cell(nextIt->second, Cell::norate);
+          }
+        }
+        ++nextIt;
+        nextToVisitCurs.pop_front();
+      }
+    }
+  }
+
+  // exchanges 'value' amount of currency 'from' to currency 'to' in O(N) time,
+  // where N is minimal possible number of intermediate conversions
+  double convert(double value, CurId from, CurId to)
+  {
+    if (mPaths[from].count(to) == 0)
+      return 0.0d;
+    if (from == to)
+      return value;
+    double totalRate = 1.0d;
+    CurId prevCur = from;
+    CurId nextCur = from;
+    do
+    {
+      nextCur = mPaths[prevCur][to].nextCur;
+      int32_t rateId = mPaths[prevCur][nextCur].rateId;
+      if (rateId > 0)
+      {
+        totalRate *= mRates[rateId]();
+      }
+      else
+      {
+        double rate = mRates[-rateId]();
+        if (rate == 0)
+          totalRate = 0;
+        else
+          totalRate /= mRates[-rateId]();
+      }
+      prevCur = nextCur;
+    } while (nextCur != to);
+
+	// weird compiler behavior, when multiplication result is 0 (seems casts to int)
+	double finalValue = static_cast<long double>(totalRate) * static_cast<long double>(value);
+    return finalValue;
+  }
+
+private:
+  struct Cell
+  {
+    int32_t rateId;
+    static const int32_t norate{0};
+    CurId nextCur;
+    Cell()
+      : rateId(norate)
+      , nextCur(MAX_CUR_NUMBER)
+    {}
+    Cell(CurId _nextCur, int32_t _rateId)
+      : rateId(_rateId)
+      , nextCur(_nextCur)
+    {}
+  };
+  std::vector<std::unordered_map<CurId, Cell>> mPaths;
+  std::vector<RateFn> mRates;
+};
+
 // It's not canonical GOF Factory
 class ConverterFactory
 {
 public:
-  enum class Type { STUPID, OPTIMIZED, BFS};
+  enum class Type { INCREMENTAL, BFS};
   void setType(Type type) { mType = type; }
   std::unique_ptr<IConverter> create() const
   {
     switch(mType)
     {
-      case Type::STUPID:
+      case Type::INCREMENTAL:
         return std::make_unique<Converter>();
-      case Type::OPTIMIZED:
       case Type::BFS:
-        throw;
+        return std::make_unique<BFSConverter>();
     }
+    return std::make_unique<BFSConverter>();
   }
 private:
   Type mType;
@@ -158,7 +279,7 @@ void runTests(const ConverterFactory& factory)
   {
     cout << "Test 1 one rate smoke";
     vector<ConvertRate> rates{{0,1,[](){return 2.0;}}};
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 1) == 200.0);
     assert(cvt->convert(100.0, 1, 0) == 50.0);
@@ -170,7 +291,7 @@ void runTests(const ConverterFactory& factory)
       {0,1,[](){return 2.0;}},
       {2,3,[](){return 4.0;}}
     };
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 1) == 200.0);
     assert(cvt->convert(100.0, 1, 0) == 50.0);
@@ -185,7 +306,7 @@ void runTests(const ConverterFactory& factory)
       {1,2,[](){return 3.0;}},
       {2,3,[](){return 4.0;}}
     };
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 1) == 200.0);
     assert(cvt->convert(100.0, 1, 0) == 50.0);
@@ -202,7 +323,7 @@ void runTests(const ConverterFactory& factory)
       {2,3,[](){return 4.0;}},
       {1,2,[](){return 3.0;}}
     };
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 1) == 200.0);
     assert(cvt->convert(100.0, 1, 0) == 50.0);
@@ -221,7 +342,7 @@ void runTests(const ConverterFactory& factory)
       {4,3,[](){return 5.0;}},
       {0,4,[](){return 6.0;}},
     };
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 3)  == 3000.0);
     assert(cvt->convert(3000.0, 3, 0) == 100.0);
@@ -235,7 +356,7 @@ void runTests(const ConverterFactory& factory)
       rates.push_back({i, i+1, [](){return 2.0;}});
     };
     rates.push_back({ MAX_CUR_NUMBER - 1, 0, [](){return 2.0;}});
-    auto cvt{factory.create()};
+    auto cvt = factory.create();
     cvt->init(rates);
     assert(cvt->convert(100.0, 0, 1)  == 200.0);
     assert(cvt->convert(100.0, MAX_CUR_NUMBER - 2, 0)  == 400.0);
@@ -246,7 +367,7 @@ void runTests(const ConverterFactory& factory)
 int main()
 {
   ConverterFactory factory;
-  factory.setType(ConverterFactory::Type::STUPID);
+  factory.setType(ConverterFactory::Type::BFS);
   runTests(factory);
   return 0;
 }
