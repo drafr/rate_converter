@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-const uint32_t MAX_CUR_NUMBER = 2000;
+const uint32_t MAX_CUR_NUMBER = 5;
 using CurId = uint64_t; // 1..2000
 using RateFn = std::function<double()>; // Return 0 if rate is not available;
 
@@ -148,9 +148,11 @@ public:
     // add to mPaths all direct convert rates
     // and init mRates
     // complexity is O(R), worst case O(N^2)
+    std::vector<std::list<CurId>> connections; // sparce matrix
     mRates.reserve(rates.size() + 1);
     mRates.push_back([]() { return 0.0; }); // add dummy fn
     mPaths.resize(MAX_CUR_NUMBER);
+    connections.resize(MAX_CUR_NUMBER);
     for (const auto& rate : rates)
     {
       int32_t newRateId = static_cast<int32_t>(mRates.size());
@@ -160,38 +162,38 @@ public:
       const CurId to = rate.to;
       mPaths[from][to] = Cell(to, newRateId);
       mPaths[to][from] = Cell(from, -newRateId);
+      connections[from].emplace_back(to);
+      connections[to].emplace_back(from);
     }
 
     // Do BFS from each node to find all shortest paths
     // thus complexity is O(N(N + R)) = O(N^3)
     std::vector<CurId> visitedNodes(MAX_CUR_NUMBER, MAX_CUR_NUMBER);
-    for (CurId from = 0; from < mPaths.size(); ++from)
+    for (CurId from = 0; from < connections.size(); ++from)
     {
       visitedNodes[from] = from;
-      // first - next to visit, second is started from
       using NextCur = std::pair<CurId, CurId>;
       std::list<NextCur> nextToVisitCurs;
-      for (const auto& cell : mPaths[from])
+      for (const auto& nextCur : connections[from])
       {
-        const CurId next = cell.first;
-        nextToVisitCurs.push_back(NextCur(next, next));
-        visitedNodes[next] = from;
+        nextToVisitCurs.push_back(NextCur(nextCur, nextCur));
+        visitedNodes[nextCur] = from;
       }
       auto nextIt = nextToVisitCurs.begin();
       while (nextIt != nextToVisitCurs.end())
       {
         const CurId visitingId = nextIt->first;
         visitedNodes[visitingId] = from;
-        for(const auto& nextPath : mPaths[visitingId])
+        for(const auto& nextCur : connections[visitingId])
         {
-          auto& cell = nextPath.second;
-          if (visitedNodes[cell.nextCur] != from)
+          if (visitedNodes[nextCur] != from)
           {
-            visitedNodes[cell.nextCur] = from;
-            nextToVisitCurs.emplace_back(cell.nextCur, nextIt->second);
-            mPaths[from][cell.nextCur] = Cell(nextIt->second, Cell::norate);
+            visitedNodes[nextCur] = from;
+            nextToVisitCurs.emplace_back(nextCur, nextIt->second);
+            mPaths[from][nextCur] = Cell(nextIt->second, Cell::norate);
           }
         }
+
         ++nextIt;
         nextToVisitCurs.pop_front();
       }
